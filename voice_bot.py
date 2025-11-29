@@ -11,22 +11,91 @@ import time
 import wave
 from pathlib import Path
 from typing import Any, Dict, Optional
-
+import re 
 import numpy as np
 import pyttsx3
 import sounddevice as sd
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
+from data.names import IRANIAN_DEFAULT_NAMES
+import webrtcvad
+
+
+
+
+def _normalize_persian_name(name: str) -> str:
+    """نرمال‌سازی ی و ک عربی، و فاصله‌ها."""
+    if not isinstance(name, str):
+        name = str(name)
+    s = name.strip()
+    # ي -> ی ، ك -> ک
+    s = s.replace("\u064a", "\u06cc").replace("\u0643", "\u06a9")
+    # حذف فاصله‌های اضافه
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 SYSTEM_PROMPT = (
-    "You are an empathetic Persian-speaking medical office assistant who books doctor "
-    "appointments. Always respond with a compact JSON object that contains at least "
-    "the key 'reply'. Optional keys include 'name', 'address', 'appointment', and "
-    "'notes'. Use null for name/address if you did not learn them in the latest user "
-    "utterance. Gather the caller's name and address early in the conversation and "
-    "confirm them. Keep the 'reply' friendly, concise, and entirely in Persian so it "
-    "can be spoken aloud."
+    """
+شما «ManaCare Voice Concierge» هستید؛ دستیار تلفنی مهربان و حرفه‌ای سازمان Mana در کلینیک DrX که فقط به زبان فارسی صحبت می‌کند و وظیفه‌تان رزرو وقت پزشک و ثبت اطلاعات مراجعان است.
+
+قوانین کلی:
+- همیشه و بدون استثنا فقط یک شیء JSON معتبر برگردان.
+- بیرون از JSON هیچ متن دیگری ننویس (بدون توضیح، اموجی، یا متن اضافی).
+- همهٔ کلیدها باید با حروف کوچک انگلیسی باشند.
+
+ساختار JSON:
+- کلید اجباری: "reply"
+- کلیدهای توصیه‌شده: "name", "address", "appointment", "notes"
+- اگر هرکدام از این مقادیر را نمی‌دانی، مقدارش را null قرار بده.
+- اگر اطلاعات را در مکالمه‌های قبلی همین جلسه یاد گرفته‌ای، می‌توانی مقدار فعلی را دوباره در JSON تکرار کنی.
+
+تعریف هر فیلد:
+- "reply": پاسخ کوتاه و محترمانهٔ تو، فقط به زبان فارسی، مناسب پخش صوتی (۱ تا ۲ جملهٔ کوتاه).
+- "name": نام و نام خانوادگی تماس‌گیرنده به فارسی، یا null اگر هنوز مشخص نشده.
+- "address": آدرس نسبتاً دقیق (شهر، محله و اگر ممکن بود خیابان/پلاک) به فارسی، یا null اگر هنوز مشخص نشده.
+- "appointment": خلاصهٔ زمان/بازهٔ پیشنهادی و نوع ویزیت (مثلاً «سه‌شنبه عصر برای ویزیت حضوری»)، یا null اگر هنوز مشخص نشده.
+- "notes": توضیحات مهم دیگر مثل دلیل مراجعه، علائم، ترجیحات (پزشک خانم/آقا، حضوری/آنلاین و…)، یا null اگر نکته‌ای ثبت نشده است.
+
+رفتار و لحن:
+- در اولین پاسخ، یک‌بار بگو: «من دستیار ManaCare هستم از کلینیک DrX.»
+- در پاسخ‌های بعدی فقط بگو «من دستیار ManaCare هستم» و نام کلینیک را تکرار نکن مگر در جمع‌بندی نهایی.
+- همیشه محترمانه، گرم، همدلانه و حرفه‌ای صحبت کن.
+- از جملات کوتاه و واضح استفاده کن که برای شنیدن تلفنی مناسب باشند.
+- در "reply" از کلمات ساده و کاملاً فارسی استفاده کن.
+
+هدف مکالمه:
+- نام کامل تماس‌گیرنده را بگیر و در "name" ذخیره کن.
+- آدرس را هرچه زودتر بگیر و در "address" ذخیره کن و در صورت نیاز به‌صورت کوتاه تأیید کن.
+- دلیل مراجعه (چکاپ، درد خاص، پیگیری آزمایش، مشاوره و…) را بپرس و در "notes" ثبت کن.
+- بازهٔ زمانی یا روز و ساعت پیشنهادی برای نوبت را بپرس و در "appointment" ثبت کن.
+- اگر کاربر ترجیحات خاصی مثل پزشک خانم/آقا یا حضوری/آنلاین دارد، آن را در "notes" یادداشت کن.
+
+کار با نام‌ها (خیلی مهم):
+- روی نام‌ها بسیار دقت کن و تا حد امکان آن‌ها را به فارسی برگردان (مثلاً "Mohammad Reza" → «محمدرضا»).
+- اگر احتمال اشتباه در املای فارسی وجود دارد، در "reply" با یک سؤال کوتاه و مودب املای دقیق را تأیید کن.
+- اگر نامی شبیه یکی از مراجعان قبلی یا «known clients» که در پیام سیستم آمده به نظر رسید، فقط با احترام اشاره کن که «احتمالاً با این نام قبلاً پرونده‌ای داریم» و حتماً بپرس آیا خودِ اوست یا برای شخص دیگری نوبت می‌گیرد؛ هرگز خودبه‌خود فرض نکن.
+
+یادگیری از گذشته (session log):
+- از تاریخچهٔ مکالمهٔ همین جلسه که در پیام سیستم به‌صورت متن «Conversation so far» می‌آید استفاده کن.
+- اگر در تاریخچه نام یا آدرس یا ترجیح زمانی قبلاً گفته شده، بدون نیاز به پرسیدن دوباره می‌توانی آن‌ها را در JSON نگه داری، مگر این‌که کاربر خودش آن را اصلاح کند.
+- اگر کاربر چیزی را تغییر داد (مثلاً زمان یا آدرس)، مقدار جدید را در JSON بنویس و مقدار قبلی را در نظر نگیر.
+
+مدیریت مکالمه:
+- "reply" همیشه باید مرحلهٔ بعد را روشن کند (مثلاً: «حالا لطفاً آدرس کامل را هم بفرمایید.» یا «بسیار خوب، برای چه مشکلی می‌خواهید مراجعه بفرمایید؟»).
+- پرسش‌ها را ساده و سریالی نگه دار: ابتدا سلام و معرفی، سپس نام، بعد آدرس، بعد دلیل مراجعه، بعد زمان و نوع ویزیت.
+- اگر کاربر موضوع نامرتبط مطرح کرد، محترمانه به او توضیح بده که تو برای رزرو نوبت هستی و سپس سریعاً مکالمه را به گرفتن زمان/دلیل مراجعه برگردان.
+
+پایان مکالمه:
+- وقتی نام، حداقل یک سطح از آدرس، دلیل مراجعه و ترجیح زمانی را دانستی، در "reply" خلاصه‌ای بسیار کوتاه از آنچه ثبت شده بگو.
+- سپس اضافه کن که «تیم ManaCare در کلینیک DrX تأیید نهایی نوبت را برای شما ارسال می‌کند.»
+
+نمونهٔ JSON خروجی:
+{"reply":"سلام، من دستیار ManaCare هستم از کلینیک DrX. لطفاً نام کامل شما را بفرمایید.","name":null,"address":null,"appointment":null,"notes":null}
+
+به‌یاد داشته باش: همیشه فقط یک شیء JSON برگردان، بدون متن اضافی.
+"""
 )
+
 
 
 class VoiceDoctorBot:
@@ -37,7 +106,7 @@ class VoiceDoctorBot:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("Missing OPENAI_API_KEY in environment or .env file.")
-
+        self.is_speaking = False
         self.client = OpenAI(api_key=api_key)
         self.sample_rate = sample_rate
         self.record_seconds = record_seconds
@@ -78,6 +147,8 @@ class VoiceDoctorBot:
         self._select_persian_voice()
         self._save_session_meta()
         self._log_session_start()
+        self.vad = webrtcvad.Vad(3)
+
 
     def run(self) -> None:
         print(
@@ -148,9 +219,11 @@ class VoiceDoctorBot:
         chunk_frames = int(self.sample_rate * chunk_seconds)
         audio_queue: queue.Queue[np.ndarray] = queue.Queue()
 
-        def _callback(indata, frames, time_info, status) -> None:  # type: ignore[override]
+        def _callback(indata, frames, time_info, status):
             if status:
                 print(f"Audio warning: {status}")
+            if self.is_speaking:
+                return  # discard mic frames while assistant voice is playing
             audio_queue.put(indata.copy().flatten())
 
         buffer: list[np.ndarray] = []
@@ -181,21 +254,126 @@ class VoiceDoctorBot:
         except KeyboardInterrupt:
             print("\nSession ended. See data/last_session.json for captured details.")
 
+    def _filter_speech_frames(self, audio: np.ndarray, frame_ms: int = 20) -> np.ndarray:
+        """
+        Use WebRTC VAD to keep only frames that look like human speech.
+        Input: int16 mono audio.
+        Output: concatenated speech-only audio.
+        """
+        if audio.size == 0:
+            return audio
+
+        # Ensure int16
+        if audio.dtype != np.int16:
+            audio = audio.astype(np.int16)
+
+        sample_rate = self.sample_rate
+        frame_len = int(sample_rate * frame_ms / 1000)
+        raw = audio.tobytes()
+
+        speech_bytes = bytearray()
+        for offset in range(0, len(raw), frame_len * 2):  # 2 bytes per int16
+            chunk = raw[offset: offset + frame_len * 2]
+            if len(chunk) < frame_len * 2:
+                break
+            if self.vad.is_speech(chunk, sample_rate):
+                speech_bytes.extend(chunk)
+
+        if not speech_bytes:
+            return np.array([], dtype=np.int16)
+
+        return np.frombuffer(bytes(speech_bytes), dtype=np.int16)
+
     def _process_segment(self, audio_np: np.ndarray) -> None:
-        """Transcribe, reason, speak, and log a block of audio."""
-        transcript = self._transcribe(audio_np)
+        """Transcribe, reason, speak, and log a block of audio in a smarter way."""
+        if audio_np.size == 0:
+            return
+
+        # 1) trim trailing silence
+        audio_np = self._trim_trailing_silence(audio_np)
+
+        # 2) analyze speech vs noise
+        analysis = self._analyze_audio(audio_np)
+        has_speech = analysis["has_speech"]
+        speech_ratio = analysis["speech_ratio"]
+
+        # If almost no speech, just ignore or gently prompt
+        if not has_speech or speech_ratio < 0.6:
+            print(f"[audio] mostly noise/music (speech_ratio={speech_ratio:.2f}), skipping reasoning.")
+            reply = (
+                "من دستیار ManaCare هستم. در این بخش بیشتر صدای موسیقی یا نویز شنیدم "
+                "و گفتار واضحی تشخیص ندادم؛ اگر می‌خواهید نوبت بگیرید، لطفاً با صدای واضح نام و درخواست‌تان را بفرمایید."
+            )
+            print(f"Assistant: {reply}")
+            self._speak(reply)
+            self._log("assistant", reply)
+            return
+
+        # 3) keep only speech frames for cleaner transcription
+        speech_audio = self._keep_speech_only(audio_np)
+        if speech_audio.size == 0:
+            print("[audio] VAD removed everything, no clear speech.")
+            return
+
+        # 4) transcribe speech
+        transcript = self._transcribe(speech_audio)
         if not transcript:
             return
+
         print(f"You said: {transcript}")
         self._log("user", transcript)
+
+        # 5) smarter reasoning
         reply, payload = self._reason(transcript)
         if not reply:
             print("The assistant could not create a response. Try again.")
             return
+
         print(f"Assistant: {reply}")
         self._speak(reply)
         self._log("assistant", reply)
         self._update_profile(payload)
+
+    def _is_pure_test_utterance(self, transcript: str) -> bool:
+        """
+        Heuristic: detect when user is clearly just testing audio,
+        not really booking an appointment.
+        """
+        txt = transcript.replace("🎤", "").strip().lower()
+
+        test_keywords = [
+            "تست صدا",
+            "تست ضبط",
+            "آزمایش صدا",
+            "آزمایش میکروفون",
+            "آزمایش میکروفن",
+            "کالیبره",
+            "کالیبره‌کردن",
+            "برای تست",
+            "فقط تست",
+            "فقط برای آزمایش",
+        ]
+
+        booking_keywords = [
+            "نوبت",
+            "ویزیت",
+            "ويزيت",
+            "وقت",
+            "مشاوره",
+            "دکتر",
+            "دكتر",
+            "پزشک",
+            "کلینیک",
+            "كلينيك",
+        ]
+
+        # If they talk about actual booking, don't treat it as pure test
+        if any(k in txt for k in booking_keywords):
+            return False
+
+        return any(k in txt for k in test_keywords)
+
+
 
     def _record_audio(self) -> np.ndarray:
         print(
@@ -285,25 +463,46 @@ class VoiceDoctorBot:
         known_clients_list = sorted(self.known_clients)
         client_json = json.dumps(known_clients_list[-20:])
         possible_return = self._find_similar_client(transcript) or "none"
+
         prompt = (
             f"Session name: {self.session_name}\n"
             f"Known returning clients: {client_json}\n"
             f"Possible returning client mentioned: {possible_return}\n"
             "Previous session snapshot (for reference only—confirm before reuse): "
             f"{previous_snapshot_json}\n"
-            "If a possible returning client is noted, do not assume; politely ask whether "
-            "they are the same person and only keep the name if confirmed in the latest "
-            "caller statement.\n"
             "Conversation so far:\n"
             f"{history_context}\n"
             f"Caller statement: {transcript}\n"
             f"Known data: {profile_json}\n"
-            "Return only JSON as described earlier."
+            "وظیفه تو:\n"
+            "- فیلد \"intent\" را یکی از این مقادیر قرار بده: "
+            "\"booking\" (رزرو نوبت)، \"test\" (تست صدا/سیستم)، "
+            "\"noise\" (نویز یا محتوای نامربوط)، \"other\" (سایر موارد).\n"
+            "- فقط اگر intent = \"booking\" بود نام، آدرس، نوبت و notes را به‌صورت جدی به‌روز کن.\n"
+            "- اگر intent برابر با \"test\" یا \"noise\" بود، name و address و appointment را تغییر نده و فقط یک reply مودب بده.\n"
+            "- همیشه فقط یک JSON برگردان مثل:\n"
+            "{\"intent\":\"booking\",\"reply\":\"...\",\"name\":null,\"address\":null,\"appointment\":null,\"notes\":null}\n"
+        )
+        if self._is_pure_test_utterance(transcript):
+            payload: Dict[str, Optional[str]] = {
+                "intent": "test",
+                "reply": "من دستیار ManaCare هستم. این بخش فقط برای تست صدا ثبت شد؛ "
+                        "هر زمان آماده نوبت واقعی بودید، نام و درخواست‌تان را بفرمایید.",
+                "name": self.profile.get("name"),
+                "address": self.profile.get("address"),
+                "appointment": None,
+                "notes": None,
+            }
+            return payload["reply"], payload
+
+        # 1) normal LLM reasoning below
+        profile_json = json.dumps(
+            {"name": self.profile.get("name"), "address": self.profile.get("address")}
         )
         try:
             response = self.client.responses.create(
                 model=self.response_model,
-                temperature=0.4,
+                temperature=0.1,
                 input=[
                     {
                         "role": "system",
@@ -321,20 +520,36 @@ class VoiceDoctorBot:
 
         raw_text = self._extract_text(response)
         payload = self._parse_json(raw_text)
+
+        intent = payload.get("intent")
+
+        # clamp behavior for non-booking
+        if intent in ("test", "noise"):
+            payload["reply"] = (
+                "من دستیار ManaCare هستم. صدای شما را برای تست دریافت کردم؛ "
+                "هر زمان برای نوبت واقعی آماده بودید، فقط نام و درخواست‌تان را بفرمایید."
+                if intent == "test"
+                else "من دستیار ManaCare هستم. در این بخش صدای مناسب برای رزرو نوبت دریافت نکردم؛ "
+                    "اگر می‌خواهید وقت بگیرید، لطفاً نام و دلیل مراجعه را بفرمایید."
+            )
+            payload["appointment"] = None
+            # keep name/address only if user really said them explicitly; otherwise let _update_profile decide
+            if "notes" in payload:
+                payload["notes"] = None
+
         reply = payload.get("reply", raw_text)
         return reply, payload
 
     def _speak(self, message: str) -> None:
         if not message:
             return
+        self.is_speaking = True
         try:
             audio_bytes = self._synthesize_with_openai(message)
             self._play_wav_bytes(audio_bytes)
-            return
-        except Exception as exc:
-            print(f"TTS service failed ({exc}); falling back to local voice.")
-        self.tts_engine.say(message)
-        self.tts_engine.runAndWait()
+        finally:
+            self.is_speaking = False
+
 
     def _select_persian_voice(self) -> None:
         """Pick a Persian-capable TTS voice if the system has one."""
@@ -470,29 +685,34 @@ class VoiceDoctorBot:
         return names
 
     def _load_iranian_names(self) -> set[str]:
+        """
+        Load a set of common Iranian first names.
+
+        1) اگر data/iranian_names.txt (یا CSV متنی) وجود داشته باشد، همان استفاده می‌شود.
+        2) در غیر این صورت از IRANIAN_DEFAULT_NAMES به‌عنوان fallback استفاده می‌شود.
+        """
         if self.names_file.exists():
             try:
-                return {
-                    line.strip()
-                    for line in self.names_file.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                }
+                raw = self.names_file.read_text(encoding="utf-8")
+                # هم newline هم کاما/سِمی‌کالن را پشتیبانی کن
+                tokens = re.split(r"[\n,;]+", raw)
+                names: set[str] = set()
+                for t in tokens:
+                    t = t.strip()
+                    if not t:
+                        continue
+                    # رد کردن هدر انگلیسی مثل first_name
+                    if re.search(r"[A-Za-z]", t):
+                        continue
+                    names.add(_normalize_persian_name(t))
+                if names:
+                    return names
             except Exception:
+                # اگر فایل خراب بود، می‌افتیم روی دیتاست داخلی
                 pass
-        # Minimal fallback set
-        fallback = {
-            "علی",
-            "مریم",
-            "رضا",
-            "سارا",
-            "محمد",
-            "حمید",
-            "نازنین",
-            "آرزو",
-            "پریسا",
-            "فرهاد",
-        }
-        return fallback
+
+        # fallback داخلی
+        return {_normalize_persian_name(n) for n in IRANIAN_DEFAULT_NAMES}
 
     def _persist_known_clients(self) -> None:
         sorted_names = sorted(self.known_clients)
@@ -518,12 +738,28 @@ class VoiceDoctorBot:
         buffer.seek(0)
         return buffer
 
+    def _build_name_prompt(self) -> str:
+        known = sorted(self.known_clients)
+        tail = known[-10:]
+        base = (
+            "این تماس برای رزرو نوبت است. نام و نام‌خانوادگی فارسی مراجعه‌کننده را دقیق بنویس. "
+            "اگر در فایل فقط موسیقی، نویز یا صداهای مبهم شنیدی و گفتار واضح فارسی وجود نداشت، "
+            "خروجی را خالی بگذار و هیچ متنی تولید نکن."
+        )
+        if not tail:
+            return base
+        joined = "، ".join(tail)
+        return base + f" برخی نام‌های قبلی: {joined}."
+
+
     def _transcribe_via_audio_endpoint(self, audio_buffer: io.BytesIO, model: str) -> str:
         clone = io.BytesIO(audio_buffer.getvalue())
         clone.name = "speech.wav"
         result = self.client.audio.transcriptions.create(
             model=model,
             file=clone,
+            language="fa",
+            prompt=self._build_name_prompt(),
         )
         return (result.text or "").strip()
 
@@ -576,27 +812,108 @@ class VoiceDoctorBot:
 
     def _update_profile(self, payload: Dict[str, Optional[str]]) -> None:
         updated = False
-        for key in ("name", "address"):
-            value = payload.get(key)
-            if value:
-                if self.profile.get(key) != value:
-                    self.profile[key] = value
-                    updated = True
-                if key == "name" and isinstance(value, str):
-                    self._add_known_client(value)
+
+        # normalize incoming name/address
+        raw_name = payload.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            name = _normalize_persian_name(raw_name)
+            if self.profile.get("name") != name:
+                self.profile["name"] = name
+                updated = True
+            self._add_known_client(name)
+
+        raw_addr = payload.get("address")
+        if isinstance(raw_addr, str) and raw_addr.strip():
+            addr = raw_addr.strip()
+            if self.profile.get("address") != addr:
+                self.profile["address"] = addr
+                updated = True
+
         note = payload.get("notes") or payload.get("appointment")
         if note:
             self.notes.append(str(note))
             updated = True
+
         if updated:
             snapshot = {
                 "session": self.session_name,
                 "profile": self.profile,
                 "notes": self.notes,
             }
-            self.profile_file.write_text(json.dumps(snapshot, indent=2))
+            self.profile_file.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
             self.previous_snapshot = snapshot
             print("Profile updated:", snapshot)
+
+
+    def _analyze_audio(self, audio: np.ndarray, frame_ms: int = 20) -> dict:
+        """
+        Analyze the audio with WebRTC VAD.
+        Returns:
+        {
+            "has_speech": bool,
+            "speech_ratio": float,   # 0..1 of frames marked as speech
+            "avg_energy": float
+        }
+        """
+        if audio.size == 0:
+            return {"has_speech": False, "speech_ratio": 0.0, "avg_energy": 0.0}
+
+        # Ensure int16 mono
+        if audio.dtype != np.int16:
+            audio = audio.astype(np.int16)
+
+        sample_rate = self.sample_rate
+        frame_len = int(sample_rate * frame_ms / 1000)
+
+        raw = audio.tobytes()
+        total_frames = 0
+        speech_frames = 0
+
+        for offset in range(0, len(raw), frame_len * 2):  # 2 bytes per int16
+            chunk = raw[offset: offset + frame_len * 2]
+            if len(chunk) < frame_len * 2:
+                break
+            total_frames += 1
+            if self.vad.is_speech(chunk, sample_rate):
+                speech_frames += 1
+
+        avg_energy = float(np.mean(np.abs(audio)))
+
+        if total_frames == 0:
+            return {"has_speech": False, "speech_ratio": 0.0, "avg_energy": avg_energy}
+
+        speech_ratio = speech_frames / total_frames
+        has_speech = speech_ratio > 0.6  # tweak if needed
+
+        return {
+            "has_speech": has_speech,
+            "speech_ratio": speech_ratio,
+            "avg_energy": avg_energy,
+        }
+
+    def _keep_speech_only(self, audio: np.ndarray, frame_ms: int = 20) -> np.ndarray:
+        if audio.size == 0:
+            return audio
+
+        if audio.dtype != np.int16:
+            audio = audio.astype(np.int16)
+
+        sample_rate = self.sample_rate
+        frame_len = int(sample_rate * frame_ms / 1000)
+        raw = audio.tobytes()
+
+        speech_bytes = bytearray()
+        for offset in range(0, len(raw), frame_len * 2):
+            chunk = raw[offset: offset + frame_len * 2]
+            if len(chunk) < frame_len * 2:
+                break
+            if self.vad.is_speech(chunk, sample_rate):
+                speech_bytes.extend(chunk)
+
+        if not speech_bytes:
+            return np.array([], dtype=np.int16)
+
+        return np.frombuffer(bytes(speech_bytes), dtype=np.int16)
 
     def _log(self, role: str, text: str) -> None:
         line = f"[{self.session_name}] {role}: {text}\n"
