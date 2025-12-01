@@ -1,4 +1,4 @@
-"""Voice-based doctor reservation assistant powered by OpenAI."""
+"""Voice-based doctor reservation assistant powered by OpenAI (refactored)."""
 from __future__ import annotations
 
 import argparse
@@ -9,19 +9,22 @@ import os
 import queue
 import time
 import wave
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
-import re 
+from typing import Any, Dict, Optional, List, Tuple
+
+import re
 import numpy as np
 import pyttsx3
 import sounddevice as sd
+import webrtcvad
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
+
 from data.names import IRANIAN_DEFAULT_NAMES
-import webrtcvad
 
 
-
+# ---------- Helpers & constants ----------
 
 def _normalize_persian_name(name: str) -> str:
     """نرمال‌سازی ی و ک عربی، و فاصله‌ها."""
@@ -34,8 +37,8 @@ def _normalize_persian_name(name: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-SYSTEM_PROMPT = (
-    """
+
+SYSTEM_PROMPT = """
 شما «ManaCare Voice Concierge» هستید؛ دستیار تلفنی مهربان و حرفه‌ای سازمان Mana در کلینیک DrX که فقط به زبان فارسی صحبت می‌کند و وظیفه‌تان رزرو وقت پزشک و ثبت اطلاعات مراجعان است.
 
 قوانین کلی:
@@ -93,27 +96,66 @@ SYSTEM_PROMPT = (
 {"reply":"سلام، من دستیار ManaCare هستم از کلینیک DrX. لطفاً نام کامل شما را بفرمایید.","name":null,"address":null,"appointment":null,"notes":null}
 
 به‌یاد داشته باش: همیشه فقط یک شیء JSON برگردان، بدون متن اضافی.
-"""
-)
+""".strip()
 
+
+@dataclass
+class BotConfig:
+    sample_rate: int = 16000
+    record_seconds: float = 8.0
+
+    push_chunk_seconds: float = 0.3
+    push_silence_timeout: float = 0.6
+    push_energy_threshold: float = 80.0
+    silence_trim_threshold: float = 40.0
+
+    realtime_chunk_seconds: float = 0.25
+    realtime_silence_timeout: float = 0.35
+    realtime_energy_threshold: float = 200.0
+
+    vad_aggressiveness: int = 1
+    use_vad_for_filtering: bool = False  # اگر خواستی فقط speech-frameها ترنسکرایب شوند، True کن.
+
+    history_limit: int = 16
+
+    tts_model: str = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+    tts_voice: str = os.getenv("OPENAI_TTS_VOICE", "alloy")
+    response_model: str = os.getenv("OPENAI_RESPONSE_MODEL", "gpt-4o-mini")
+    transcription_model: str = os.getenv(
+        "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"
+    )
+    transcription_fallback: str = os.getenv(
+        "OPENAI_TRANSCRIBE_FALLBACK", "gpt-4o-mini-transcribe"
+    )
+
+    data_dir: Path = Path("data")
 
 
 class VoiceDoctorBot:
     """Conversational loop that records audio, transcribes, reasons, and speaks."""
 
-    def __init__(self, record_seconds: float = 8.0, sample_rate: int = 16000) -> None:
+    def __init__(self, config: Optional[BotConfig] = None) -> None:
         load_dotenv()
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("Missing OPENAI_API_KEY in environment or .env file.")
-        self.is_speaking = False
+
+        self.config = config or BotConfig()
         self.client = OpenAI(api_key=api_key)
-        self.sample_rate = sample_rate
-        self.record_seconds = record_seconds
+
+        self.is_speaking = False
+        self.sample_rate = self.config.sample_rate
+        self.record_seconds = self.config.record_seconds
+
+        # state
         self.profile: Dict[str, Optional[str]] = {"name": None, "address": None}
-        self.notes: list[str] = []
+        self.notes: List[str] = []
         self.previous_snapshot: Optional[Dict[str, Any]] = None
-        self.data_dir = Path("data")
+        self.history: List[Dict[str, str]] = []
+        self._transcribe_warned = False
+
+        # files
+        self.data_dir = self.config.data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.session_log = self.data_dir / "session_log.txt"
         self.profile_file = self.data_dir / "last_session.json"
@@ -121,23 +163,25 @@ class VoiceDoctorBot:
         self.session_meta_file = self.data_dir / "session_meta.json"
         self.prompt_file = self.data_dir / "custom_prompt.txt"
         self.names_file = self.data_dir / "iranian_names.txt"
+
+        # tts
         self.tts_engine = pyttsx3.init()
-        self.tts_model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-        self.tts_voice = os.getenv("OPENAI_TTS_VOICE", "alloy")
-        self.response_model = os.getenv("OPENAI_RESPONSE_MODEL", "gpt-4o-mini")
-        self.transcription_model = os.getenv(
-            "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"
-        )
-        self.transcription_fallback = os.getenv(
-            "OPENAI_TRANSCRIBE_FALLBACK", "gpt-4o-mini-transcribe"
-        )
-        self._transcribe_warned = False
-        self.history_limit = 16
-        self.history: list[Dict[str, str]] = []
-        self.push_chunk_seconds = 0.3
-        self.push_silence_timeout = 0.6
-        self.push_energy_threshold = 180.0
-        self.silence_trim_threshold = 65.0
+        self.tts_model = self.config.tts_model
+        self.tts_voice = self.config.tts_voice
+
+        # models
+        self.response_model = self.config.response_model
+        self.transcription_model = self.config.transcription_model
+        self.transcription_fallback = self.config.transcription_fallback
+
+        # misc config
+        self.push_chunk_seconds = self.config.push_chunk_seconds
+        self.push_silence_timeout = self.config.push_silence_timeout
+        self.push_energy_threshold = self.config.push_energy_threshold
+        self.silence_trim_threshold = self.config.silence_trim_threshold
+        self.history_limit = self.config.history_limit
+
+        # session
         self.session_name = self._generate_session_name()
         self.known_clients: set[str] = self._load_known_clients()
         self.iranian_name_list: set[str] = self._load_iranian_names()
@@ -147,8 +191,11 @@ class VoiceDoctorBot:
         self._select_persian_voice()
         self._save_session_meta()
         self._log_session_start()
-        self.vad = webrtcvad.Vad(3)
 
+        # VAD
+        self.vad = webrtcvad.Vad(self.config.vad_aggressiveness)
+
+    # ---------- Public entrypoints ----------
 
     def run(self) -> None:
         print(
@@ -163,6 +210,9 @@ class VoiceDoctorBot:
 
             try:
                 audio_np = self._record_audio()
+                if audio_np.size == 0:
+                    print("No audio captured. Try again.")
+                    continue
                 transcript = self._transcribe(audio_np)
             except Exception as exc:  # broad to keep loop alive
                 print(f"Recording or transcription failed: {exc}")
@@ -205,11 +255,15 @@ class VoiceDoctorBot:
 
     def run_realtime(
         self,
-        chunk_seconds: float = 0.25,
-        silence_timeout: float = 0.35,
-        energy_threshold: float = 200.0,
+        chunk_seconds: Optional[float] = None,
+        silence_timeout: Optional[float] = None,
+        energy_threshold: Optional[float] = None,
     ) -> None:
         """Continuously listen for speech and answer as soon as silence is detected."""
+        chunk_seconds = chunk_seconds or self.config.realtime_chunk_seconds
+        silence_timeout = silence_timeout or self.config.realtime_silence_timeout
+        energy_threshold = energy_threshold or self.config.realtime_energy_threshold
+
         print(
             "Realtime Doctor Voice Assistant listening.\n"
             f"Session '{self.session_name}' at DrX clinic.\n"
@@ -217,7 +271,7 @@ class VoiceDoctorBot:
             "Press Ctrl+C to end the session."
         )
         chunk_frames = int(self.sample_rate * chunk_seconds)
-        audio_queue: queue.Queue[np.ndarray] = queue.Queue()
+        audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
 
         def _callback(indata, frames, time_info, status):
             if status:
@@ -226,7 +280,7 @@ class VoiceDoctorBot:
                 return  # discard mic frames while assistant voice is playing
             audio_queue.put(indata.copy().flatten())
 
-        buffer: list[np.ndarray] = []
+        buffer: List[np.ndarray] = []
         silence_since: Optional[float] = None
 
         try:
@@ -254,126 +308,7 @@ class VoiceDoctorBot:
         except KeyboardInterrupt:
             print("\nSession ended. See data/last_session.json for captured details.")
 
-    def _filter_speech_frames(self, audio: np.ndarray, frame_ms: int = 20) -> np.ndarray:
-        """
-        Use WebRTC VAD to keep only frames that look like human speech.
-        Input: int16 mono audio.
-        Output: concatenated speech-only audio.
-        """
-        if audio.size == 0:
-            return audio
-
-        # Ensure int16
-        if audio.dtype != np.int16:
-            audio = audio.astype(np.int16)
-
-        sample_rate = self.sample_rate
-        frame_len = int(sample_rate * frame_ms / 1000)
-        raw = audio.tobytes()
-
-        speech_bytes = bytearray()
-        for offset in range(0, len(raw), frame_len * 2):  # 2 bytes per int16
-            chunk = raw[offset: offset + frame_len * 2]
-            if len(chunk) < frame_len * 2:
-                break
-            if self.vad.is_speech(chunk, sample_rate):
-                speech_bytes.extend(chunk)
-
-        if not speech_bytes:
-            return np.array([], dtype=np.int16)
-
-        return np.frombuffer(bytes(speech_bytes), dtype=np.int16)
-
-    def _process_segment(self, audio_np: np.ndarray) -> None:
-        """Transcribe, reason, speak, and log a block of audio in a smarter way."""
-        if audio_np.size == 0:
-            return
-
-        # 1) trim trailing silence
-        audio_np = self._trim_trailing_silence(audio_np)
-
-        # 2) analyze speech vs noise
-        analysis = self._analyze_audio(audio_np)
-        has_speech = analysis["has_speech"]
-        speech_ratio = analysis["speech_ratio"]
-
-        # If almost no speech, just ignore or gently prompt
-        if not has_speech or speech_ratio < 0.6:
-            print(f"[audio] mostly noise/music (speech_ratio={speech_ratio:.2f}), skipping reasoning.")
-            reply = (
-                "من دستیار ManaCare هستم. در این بخش بیشتر صدای موسیقی یا نویز شنیدم "
-                "و گفتار واضحی تشخیص ندادم؛ اگر می‌خواهید نوبت بگیرید، لطفاً با صدای واضح نام و درخواست‌تان را بفرمایید."
-            )
-            print(f"Assistant: {reply}")
-            self._speak(reply)
-            self._log("assistant", reply)
-            return
-
-        # 3) keep only speech frames for cleaner transcription
-        speech_audio = self._keep_speech_only(audio_np)
-        if speech_audio.size == 0:
-            print("[audio] VAD removed everything, no clear speech.")
-            return
-
-        # 4) transcribe speech
-        transcript = self._transcribe(speech_audio)
-        if not transcript:
-            return
-
-        print(f"You said: {transcript}")
-        self._log("user", transcript)
-
-        # 5) smarter reasoning
-        reply, payload = self._reason(transcript)
-        if not reply:
-            print("The assistant could not create a response. Try again.")
-            return
-
-        print(f"Assistant: {reply}")
-        self._speak(reply)
-        self._log("assistant", reply)
-        self._update_profile(payload)
-
-    def _is_pure_test_utterance(self, transcript: str) -> bool:
-        """
-        Heuristic: detect when user is clearly just testing audio,
-        not really booking an appointment.
-        """
-        txt = transcript.replace("🎤", "").strip().lower()
-
-        test_keywords = [
-            "تست صدا",
-            "تست ضبط",
-            "آزمایش صدا",
-            "آزمایش میکروفون",
-            "آزمایش میکروفن",
-            "کالیبره",
-            "کالیبره‌کردن",
-            "برای تست",
-            "فقط تست",
-            "فقط برای آزمایش",
-        ]
-
-        booking_keywords = [
-            "نوبت",
-            "ویزیت",
-            "ويزيت",
-            "وقت",
-            "مشاوره",
-            "دکتر",
-            "دكتر",
-            "پزشک",
-            "کلینیک",
-            "كلينيك",
-        ]
-
-        # If they talk about actual booking, don't treat it as pure test
-        if any(k in txt for k in booking_keywords):
-            return False
-
-        return any(k in txt for k in test_keywords)
-
-
+    # ---------- Audio capture & processing ----------
 
     def _record_audio(self) -> np.ndarray:
         print(
@@ -383,14 +318,14 @@ class VoiceDoctorBot:
         sd.stop()
         chunk_frames = max(1, int(self.sample_rate * self.push_chunk_seconds))
         max_frames = int(self.sample_rate * self.record_seconds)
-        audio_queue: queue.Queue[np.ndarray] = queue.Queue()
+        audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
 
         def _callback(indata, frames, time_info, status) -> None:  # type: ignore[override]
             if status:
                 print(f"Audio warning: {status}")
             audio_queue.put(indata.copy().flatten())
 
-        buffer: list[np.ndarray] = []
+        buffer: List[np.ndarray] = []
         total_frames = 0
         silence_since: Optional[float] = None
 
@@ -430,12 +365,123 @@ class VoiceDoctorBot:
 
         if not buffer:
             return np.array([], dtype=np.int16)
+
         audio = np.concatenate(buffer)
+
+        # debug save
+        debug_file = self.data_dir / "last_raw.wav"
+        try:
+            with wave.open(str(debug_file), "wb") as f:
+                f.setnchannels(1)
+                f.setsampwidth(2)
+                f.setframerate(self.sample_rate)
+                f.writeframes(audio.tobytes())
+            print(f"[debug] saved raw audio to {debug_file}")
+        except Exception as exc:
+            print(f"[debug] failed to save raw audio: {exc}")
+
         return self._trim_trailing_silence(audio)
+
+    def _process_segment(self, audio_np: np.ndarray) -> None:
+        """Realtime: trim, optionally VAD-filter, transcribe, reason, speak."""
+        if audio_np.size == 0:
+            return
+
+        audio_np = self._trim_trailing_silence(audio_np)
+
+        # اختیاری: فقط قطعات حاوی گفتار را نگه داریم
+        if self.config.use_vad_for_filtering:
+            speech_only = self._keep_speech_only(audio_np)
+            if speech_only.size > 0:
+                audio_np = speech_only
+
+        if audio_np.size == 0:
+            print("[audio] no usable speech after filtering.")
+            return
+
+        transcript = self._transcribe(audio_np)
+        if not transcript:
+            print("No transcript from model.")
+            return
+
+        print(f"You said: {transcript}")
+        self._log("user", transcript)
+
+        reply, payload = self._reason(transcript)
+        if not reply:
+            print("The assistant could not create a response. Try again.")
+            return
+
+        print(f"Assistant: {reply}")
+        self._speak(reply)
+        self._log("assistant", reply)
+        self._update_profile(payload)
+
+    def _trim_trailing_silence(self, audio: np.ndarray) -> np.ndarray:
+        if audio.size == 0:
+            return audio
+        threshold = self.silence_trim_threshold
+        abs_audio = np.abs(audio)
+        idx = len(audio) - 1
+        while idx >= 0 and abs_audio[idx] <= threshold:
+            idx -= 1
+        if idx <= 0:
+            return audio
+        return audio[: idx + 1]
+
+    def _keep_speech_only(self, audio: np.ndarray, frame_ms: int = 20) -> np.ndarray:
+        if audio.size == 0:
+            return audio
+
+        if audio.dtype != np.int16:
+            audio = audio.astype(np.int16)
+
+        sample_rate = self.sample_rate
+        frame_len = int(sample_rate * frame_ms / 1000)
+        raw = audio.tobytes()
+
+        speech_bytes = bytearray()
+        for offset in range(0, len(raw), frame_len * 2):
+            chunk = raw[offset: offset + frame_len * 2]
+            if len(chunk) < frame_len * 2:
+                break
+            if self.vad.is_speech(chunk, sample_rate):
+                speech_bytes.extend(chunk)
+
+        if not speech_bytes:
+            return np.array([], dtype=np.int16)
+
+        return np.frombuffer(bytes(speech_bytes), dtype=np.int16)
+
+    # ---------- Transcription ----------
+
+    def _to_wav_bytes(self, audio: np.ndarray) -> io.BytesIO:
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(self.sample_rate)
+            wav_file.writeframes(audio.tobytes())
+        buffer.seek(0)
+        return buffer
+
+    def _build_name_prompt(self) -> str:
+        known = sorted(self.known_clients)
+        tail = known[-10:]
+        base = (
+            "این تماس برای رزرو نوبت است. نام و نام‌خانوادگی فارسی مراجعه‌کننده را دقیق بنویس. "
+            "اگر در فایل فقط موسیقی، نویز یا صداهای مبهم شنیدی و گفتار واضح فارسی وجود نداشت، "
+            "خروجی را خالی بگذار و هیچ متنی تولید نکن."
+        )
+        if not tail:
+            return base
+        joined = "، ".join(tail)
+        return base + f" برخی نام‌های قبلی: {joined}."
 
     def _transcribe(self, audio: np.ndarray) -> str:
         audio_buffer = self._to_wav_bytes(audio)
         audio_buffer.name = "speech.wav"
+
         use_audio_endpoint = any(
             marker in self.transcription_model.lower()
             for marker in ("transcribe", "whisper")
@@ -454,14 +500,106 @@ class VoiceDoctorBot:
                 self._transcribe_warned = True
             return self._transcribe_via_audio_endpoint(audio_buffer, self.transcription_fallback)
 
-    def _reason(self, transcript: str) -> tuple[str, Dict[str, Optional[str]]]:
+    def _transcribe_via_audio_endpoint(self, audio_buffer: io.BytesIO, model: str) -> str:
+        clone = io.BytesIO(audio_buffer.getvalue())
+        clone.name = "speech.wav"
+        result = self.client.audio.transcriptions.create(
+            model=model,
+            file=clone,
+            language="fa",
+            prompt=self._build_name_prompt(),
+        )
+        return (result.text or "").strip()
+
+    def _transcribe_via_responses(self, audio_buffer: io.BytesIO) -> str:
+        payload = base64.b64encode(audio_buffer.getvalue()).decode("ascii")
+        instruction = (
+            "Transcribe the following Persian speech. The audio is a base64-encoded WAV "
+            "string. Decode it and reply with only the transcript.\n"
+            f"{payload}"
+        )
+        response = self.client.responses.create(
+            model=self.transcription_model,
+            input=[
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": instruction}],
+                }
+            ],
+        )
+        return self._extract_text(response)
+
+    def _extract_text(self, response) -> str:
+        chunks: List[str] = []
+        for item in getattr(response, "output", []) or []:
+            for content in getattr(item, "content", []) or []:
+                if getattr(content, "type", None) == "output_text":
+                    chunks.append(getattr(content, "text", ""))
+        return "".join(chunks).strip()
+
+    # ---------- Reasoning / JSON orchestration ----------
+
+    def _is_pure_test_utterance(self, transcript: str) -> bool:
+        """
+        Heuristic: detect when user is clearly just testing audio,
+        not really booking an appointment.
+        """
+        txt = transcript.replace("🎤", "").strip().lower()
+
+        test_keywords = [
+            "تست صدا",
+            "تست ضبط",
+            "آزمایش صدا",
+            "آزمایش میکروفون",
+            "آزمایش میکروفن",
+            "کالیبره",
+            "کالیبره‌کردن",
+            "برای تست",
+            "فقط تست",
+            "فقط برای آزمایش",
+        ]
+
+        booking_keywords = [
+            "نوبت",
+            "ویزیت",
+            "ويزيت",
+            "وقت",
+            "مشاوره",
+            "دکتر",
+            "دكتر",
+            "پزشک",
+            "کلینیک",
+            "كلينيك",
+        ]
+
+        if any(k in txt for k in booking_keywords):
+            return False
+        return any(k in txt for k in test_keywords)
+
+    def _reason(self, transcript: str) -> Tuple[str, Dict[str, Optional[str]]]:
+        # تست ساده بدون رفتن به LLM
+        if self._is_pure_test_utterance(transcript):
+            payload: Dict[str, Optional[str]] = {
+                "intent": "test",
+                "reply": (
+                    "من دستیار ManaCare هستم. این بخش فقط برای تست صدا ثبت شد؛ "
+                    "هر زمان آماده نوبت واقعی بودید، نام و درخواست‌تان را بفرمایید."
+                ),
+                "name": self.profile.get("name"),
+                "address": self.profile.get("address"),
+                "appointment": None,
+                "notes": None,
+            }
+            return payload["reply"], payload
+
         profile_json = json.dumps(
-            {"name": self.profile.get("name"), "address": self.profile.get("address")}
+            {"name": self.profile.get("name"), "address": self.profile.get("address")},
+            ensure_ascii=False,
         )
         history_context = self._history_context()
-        previous_snapshot_json = json.dumps(self.previous_snapshot or {})
+        previous_snapshot_json = json.dumps(self.previous_snapshot or {}, ensure_ascii=False)
         known_clients_list = sorted(self.known_clients)
-        client_json = json.dumps(known_clients_list[-20:])
+        client_json = json.dumps(known_clients_list[-20:], ensure_ascii=False)
         possible_return = self._find_similar_client(transcript) or "none"
 
         prompt = (
@@ -483,22 +621,7 @@ class VoiceDoctorBot:
             "- همیشه فقط یک JSON برگردان مثل:\n"
             "{\"intent\":\"booking\",\"reply\":\"...\",\"name\":null,\"address\":null,\"appointment\":null,\"notes\":null}\n"
         )
-        if self._is_pure_test_utterance(transcript):
-            payload: Dict[str, Optional[str]] = {
-                "intent": "test",
-                "reply": "من دستیار ManaCare هستم. این بخش فقط برای تست صدا ثبت شد؛ "
-                        "هر زمان آماده نوبت واقعی بودید، نام و درخواست‌تان را بفرمایید.",
-                "name": self.profile.get("name"),
-                "address": self.profile.get("address"),
-                "appointment": None,
-                "notes": None,
-            }
-            return payload["reply"], payload
 
-        # 1) normal LLM reasoning below
-        profile_json = json.dumps(
-            {"name": self.profile.get("name"), "address": self.profile.get("address")}
-        )
         try:
             response = self.client.responses.create(
                 model=self.response_model,
@@ -516,10 +639,23 @@ class VoiceDoctorBot:
             )
         except OpenAIError as exc:
             print(f"OpenAI request failed: {exc}")
-            return "", {}
+            # fallback: جواب خیلی ساده
+            fallback_reply = (
+                "من دستیار ManaCare هستم. در دریافت پاسخ فنی مشکل پیش آمد؛ "
+                "لطفاً یک بار دیگر به‌صورت کوتاه نام و دلیل مراجعه را بفرمایید."
+            )
+            payload = {
+                "intent": "other",
+                "reply": fallback_reply,
+                "name": self.profile.get("name"),
+                "address": self.profile.get("address"),
+                "appointment": None,
+                "notes": None,
+            }
+            return fallback_reply, payload
 
         raw_text = self._extract_text(response)
-        payload = self._parse_json(raw_text)
+        payload = self._normalize_payload(raw_text)
 
         intent = payload.get("intent")
 
@@ -530,26 +666,53 @@ class VoiceDoctorBot:
                 "هر زمان برای نوبت واقعی آماده بودید، فقط نام و درخواست‌تان را بفرمایید."
                 if intent == "test"
                 else "من دستیار ManaCare هستم. در این بخش صدای مناسب برای رزرو نوبت دریافت نکردم؛ "
-                    "اگر می‌خواهید وقت بگیرید، لطفاً نام و دلیل مراجعه را بفرمایید."
+                     "اگر می‌خواهید وقت بگیرید، لطفاً نام و دلیل مراجعه را بفرمایید."
             )
             payload["appointment"] = None
-            # keep name/address only if user really said them explicitly; otherwise let _update_profile decide
-            if "notes" in payload:
-                payload["notes"] = None
+            payload["notes"] = None
 
-        reply = payload.get("reply", raw_text)
+        reply = payload.get("reply") or raw_text
         return reply, payload
 
-    def _speak(self, message: str) -> None:
-        if not message:
-            return
-        self.is_speaking = True
+    def _normalize_payload(self, blob: str) -> Dict[str, Optional[str]]:
+        """
+        Ensure we always return a dict with standard keys:
+        intent, reply, name, address, appointment, notes
+        """
+        data: Dict[str, Any]
         try:
-            audio_bytes = self._synthesize_with_openai(message)
-            self._play_wav_bytes(audio_bytes)
-        finally:
-            self.is_speaking = False
+            data_raw = json.loads(blob)
+            if isinstance(data_raw, dict):
+                data = data_raw
+            else:
+                data = {}
+        except json.JSONDecodeError:
+            data = {}
 
+        intent = str(data.get("intent") or "booking")
+        reply = data.get("reply")
+        name = data.get("name")
+        address = data.get("address")
+        appointment = data.get("appointment")
+        notes = data.get("notes")
+
+        # normalize nulls
+        def _clean(x):
+            if x is None:
+                return None
+            s = str(x).strip()
+            return s or None
+
+        return {
+            "intent": _clean(intent),
+            "reply": _clean(reply),
+            "name": _clean(name),
+            "address": _clean(address),
+            "appointment": _clean(appointment),
+            "notes": _clean(notes),
+        }
+
+    # ---------- TTS ----------
 
     def _select_persian_voice(self) -> None:
         """Pick a Persian-capable TTS voice if the system has one."""
@@ -589,7 +752,7 @@ class VoiceDoctorBot:
     def _play_wav_bytes(self, wav_bytes: bytes) -> None:
         if not wav_bytes:
             return
-        sd.stop()  # stop any lingering playback before starting a new clip
+        sd.stop()
         buffer = io.BytesIO(wav_bytes)
         with wave.open(buffer, "rb") as wav_file:
             sample_rate = wav_file.getframerate()
@@ -612,6 +775,35 @@ class VoiceDoctorBot:
 
         sd.play(audio, sample_rate)
         sd.wait()
+
+    def _speak(self, message: str) -> None:
+        if not message:
+            return
+        self.is_speaking = True
+        try:
+            audio_bytes = self._synthesize_with_openai(message)
+            self._play_wav_bytes(audio_bytes)
+        finally:
+            self.is_speaking = False
+
+    # ---------- Session / persistence ----------
+
+    def _generate_session_name(self) -> str:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        suffix = os.urandom(2).hex()
+        return f"drx-{timestamp}-{suffix}"
+
+    def _save_session_meta(self) -> None:
+        meta = {
+            "session_name": self.session_name,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        self.session_meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    def _log_session_start(self) -> None:
+        line = f"[{self.session_name}] session: started at {time.ctime()}\n"
+        with self.session_log.open("a", encoding="utf-8") as handle:
+            handle.write(line)
 
     def _load_last_session(self) -> None:
         """Seed profile and notes from the previous session if available."""
@@ -641,30 +833,12 @@ class VoiceDoctorBot:
         self.system_prompt = content
 
     def _load_history_from_log(self) -> None:
-        """Warm conversation memory from the existing session log."""
-        entries = []
+        entries: List[Dict[str, str]] = []
         for _, role, text in self._iter_log_entries():
             if role in ("user", "assistant"):
                 entries.append({"role": role, "text": text})
         if entries:
             self.history = entries[-self.history_limit :]
-
-    def _generate_session_name(self) -> str:
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        suffix = os.urandom(2).hex()
-        return f"drx-{timestamp}-{suffix}"
-
-    def _save_session_meta(self) -> None:
-        meta = {
-            "session_name": self.session_name,
-            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        self.session_meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    def _log_session_start(self) -> None:
-        line = f"[{self.session_name}] session: started at {time.ctime()}\n"
-        with self.session_log.open("a", encoding="utf-8") as handle:
-            handle.write(line)
 
     def _load_known_clients(self) -> set[str]:
         if self.clients_file.exists():
@@ -687,31 +861,23 @@ class VoiceDoctorBot:
     def _load_iranian_names(self) -> set[str]:
         """
         Load a set of common Iranian first names.
-
-        1) اگر data/iranian_names.txt (یا CSV متنی) وجود داشته باشد، همان استفاده می‌شود.
-        2) در غیر این صورت از IRANIAN_DEFAULT_NAMES به‌عنوان fallback استفاده می‌شود.
         """
         if self.names_file.exists():
             try:
                 raw = self.names_file.read_text(encoding="utf-8")
-                # هم newline هم کاما/سِمی‌کالن را پشتیبانی کن
                 tokens = re.split(r"[\n,;]+", raw)
                 names: set[str] = set()
                 for t in tokens:
                     t = t.strip()
                     if not t:
                         continue
-                    # رد کردن هدر انگلیسی مثل first_name
                     if re.search(r"[A-Za-z]", t):
                         continue
                     names.add(_normalize_persian_name(t))
                 if names:
                     return names
             except Exception:
-                # اگر فایل خراب بود، می‌افتیم روی دیتاست داخلی
                 pass
-
-        # fallback داخلی
         return {_normalize_persian_name(n) for n in IRANIAN_DEFAULT_NAMES}
 
     def _persist_known_clients(self) -> None:
@@ -728,79 +894,6 @@ class VoiceDoctorBot:
             self.known_clients.add(clean)
             self._persist_known_clients()
 
-    def _to_wav_bytes(self, audio: np.ndarray) -> io.BytesIO:
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(self.sample_rate)
-            wav_file.writeframes(audio.tobytes())
-        buffer.seek(0)
-        return buffer
-
-    def _build_name_prompt(self) -> str:
-        known = sorted(self.known_clients)
-        tail = known[-10:]
-        base = (
-            "این تماس برای رزرو نوبت است. نام و نام‌خانوادگی فارسی مراجعه‌کننده را دقیق بنویس. "
-            "اگر در فایل فقط موسیقی، نویز یا صداهای مبهم شنیدی و گفتار واضح فارسی وجود نداشت، "
-            "خروجی را خالی بگذار و هیچ متنی تولید نکن."
-        )
-        if not tail:
-            return base
-        joined = "، ".join(tail)
-        return base + f" برخی نام‌های قبلی: {joined}."
-
-
-    def _transcribe_via_audio_endpoint(self, audio_buffer: io.BytesIO, model: str) -> str:
-        clone = io.BytesIO(audio_buffer.getvalue())
-        clone.name = "speech.wav"
-        result = self.client.audio.transcriptions.create(
-            model=model,
-            file=clone,
-            language="fa",
-            prompt=self._build_name_prompt(),
-        )
-        return (result.text or "").strip()
-
-    def _trim_trailing_silence(self, audio: np.ndarray) -> np.ndarray:
-        if audio.size == 0:
-            return audio
-        threshold = self.silence_trim_threshold
-        abs_audio = np.abs(audio)
-        idx = len(audio) - 1
-        while idx >= 0 and abs_audio[idx] <= threshold:
-            idx -= 1
-        if idx <= 0:
-            return audio
-        return audio[: idx + 1]
-
-    def _transcribe_via_responses(self, audio_buffer: io.BytesIO) -> str:
-        payload = base64.b64encode(audio_buffer.getvalue()).decode("ascii")
-        instruction = (
-            "Transcribe the following Persian speech. The audio is a base64-encoded WAV "
-            "string. Decode it and reply with only the transcript.\n"
-            f"{payload}"
-        )
-        response = self.client.responses.create(
-            model=self.transcription_model,
-            input=[
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": instruction}],
-                }
-            ],
-        )
-        return self._extract_text(response)
-
-    def _extract_text(self, response) -> str:
-        chunks = []
-        for item in getattr(response, "output", []) or []:
-            for content in getattr(item, "content", []) or []:
-                if getattr(content, "type", None) == "output_text":
-                    chunks.append(getattr(content, "text", ""))
-        return "".join(chunks).strip()
-
     def _parse_json(self, blob: str) -> Dict[str, Optional[str]]:
         try:
             data = json.loads(blob)
@@ -813,7 +906,6 @@ class VoiceDoctorBot:
     def _update_profile(self, payload: Dict[str, Optional[str]]) -> None:
         updated = False
 
-        # normalize incoming name/address
         raw_name = payload.get("name")
         if isinstance(raw_name, str) and raw_name.strip():
             name = _normalize_persian_name(raw_name)
@@ -840,80 +932,14 @@ class VoiceDoctorBot:
                 "profile": self.profile,
                 "notes": self.notes,
             }
-            self.profile_file.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
+            self.profile_file.write_text(
+                json.dumps(snapshot, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
             self.previous_snapshot = snapshot
             print("Profile updated:", snapshot)
 
-
-    def _analyze_audio(self, audio: np.ndarray, frame_ms: int = 20) -> dict:
-        """
-        Analyze the audio with WebRTC VAD.
-        Returns:
-        {
-            "has_speech": bool,
-            "speech_ratio": float,   # 0..1 of frames marked as speech
-            "avg_energy": float
-        }
-        """
-        if audio.size == 0:
-            return {"has_speech": False, "speech_ratio": 0.0, "avg_energy": 0.0}
-
-        # Ensure int16 mono
-        if audio.dtype != np.int16:
-            audio = audio.astype(np.int16)
-
-        sample_rate = self.sample_rate
-        frame_len = int(sample_rate * frame_ms / 1000)
-
-        raw = audio.tobytes()
-        total_frames = 0
-        speech_frames = 0
-
-        for offset in range(0, len(raw), frame_len * 2):  # 2 bytes per int16
-            chunk = raw[offset: offset + frame_len * 2]
-            if len(chunk) < frame_len * 2:
-                break
-            total_frames += 1
-            if self.vad.is_speech(chunk, sample_rate):
-                speech_frames += 1
-
-        avg_energy = float(np.mean(np.abs(audio)))
-
-        if total_frames == 0:
-            return {"has_speech": False, "speech_ratio": 0.0, "avg_energy": avg_energy}
-
-        speech_ratio = speech_frames / total_frames
-        has_speech = speech_ratio > 0.6  # tweak if needed
-
-        return {
-            "has_speech": has_speech,
-            "speech_ratio": speech_ratio,
-            "avg_energy": avg_energy,
-        }
-
-    def _keep_speech_only(self, audio: np.ndarray, frame_ms: int = 20) -> np.ndarray:
-        if audio.size == 0:
-            return audio
-
-        if audio.dtype != np.int16:
-            audio = audio.astype(np.int16)
-
-        sample_rate = self.sample_rate
-        frame_len = int(sample_rate * frame_ms / 1000)
-        raw = audio.tobytes()
-
-        speech_bytes = bytearray()
-        for offset in range(0, len(raw), frame_len * 2):
-            chunk = raw[offset: offset + frame_len * 2]
-            if len(chunk) < frame_len * 2:
-                break
-            if self.vad.is_speech(chunk, sample_rate):
-                speech_bytes.extend(chunk)
-
-        if not speech_bytes:
-            return np.array([], dtype=np.int16)
-
-        return np.frombuffer(bytes(speech_bytes), dtype=np.int16)
+    # ---------- History / logging ----------
 
     def _log(self, role: str, text: str) -> None:
         line = f"[{self.session_name}] {role}: {text}\n"
@@ -939,17 +965,6 @@ class VoiceDoctorBot:
                 return name
         return None
 
-    def _detect_iranian_names(self, transcript: str) -> list[str]:
-        matches: list[str] = []
-        lower_transcript = transcript.lower()
-        for name in sorted(self.iranian_name_list):
-            normalized = name.lower()
-            if normalized and normalized in lower_transcript:
-                matches.append(name)
-            if len(matches) >= 5:
-                break
-        return matches
-
     def _parse_log_line(self, line: str):
         stripped = line.rstrip("\n")
         if not stripped:
@@ -971,7 +986,7 @@ class VoiceDoctorBot:
             return
         current_session: Optional[str] = None
         current_role: Optional[str] = None
-        current_lines: list[str] = []
+        current_lines: List[str] = []
         with self.session_log.open("r", encoding="utf-8") as handle:
             for raw_line in handle:
                 parsed = self._parse_log_line(raw_line)
@@ -991,10 +1006,11 @@ class VoiceDoctorBot:
             yield current_session, current_role, "\n".join(current_lines).strip()
 
 
+# ---------- CLI ----------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Doctor voice assistant powered by OpenAI."
+        description="Doctor voice assistant powered by OpenAI (refactored)."
     )
     parser.add_argument(
         "--realtime",
@@ -1004,25 +1020,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--chunk-seconds",
         type=float,
-        default=0.25,
+        default=None,
         help="Realtime chunk size (seconds) for faster speech detection.",
     )
     parser.add_argument(
         "--silence-timeout",
         type=float,
-        default=0.35,
+        default=None,
         help="Silence duration (seconds) that triggers a response in realtime mode.",
     )
     parser.add_argument(
         "--energy-threshold",
         type=float,
-        default=200.0,
+        default=None,
         help="Minimum average energy to treat audio as speech in realtime mode.",
     )
     parser.add_argument(
         "--record-seconds",
         type=float,
-        default=8.0,
+        default=None,
         help="Max duration for push-to-talk recordings.",
     )
     parser.add_argument(
@@ -1032,7 +1048,12 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    bot = VoiceDoctorBot(record_seconds=args.record_seconds)
+    cfg = BotConfig()
+    if args.record_seconds is not None:
+        cfg.record_seconds = args.record_seconds
+
+    bot = VoiceDoctorBot(config=cfg)
+
     if args.train_prompt:
         bot.train_prompt()
     elif args.realtime:
