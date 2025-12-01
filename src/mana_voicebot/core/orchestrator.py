@@ -15,6 +15,7 @@ from ..skills.produce import ProduceSkill
 from ..io.voice_io import VoiceIO
 from ..persistence.file_store import SessionStore
 from ..persistence.clients_store import ClientsStore
+from ..skills.produce import ProduceSkill
 
 
 class MultiDomainBot:
@@ -38,7 +39,7 @@ class MultiDomainBot:
             "reservation": ReservationSkill(client),
             "sales": SalesSkill(client),
             "smalltalk": SmallTalkSkill(client),
-            "produce": ProduceSkill(client),
+            "produce": ProduceSkill(client),  # 👈 این خط مهم
         }
 
         # persistence
@@ -59,45 +60,37 @@ class MultiDomainBot:
         # remember + log user
         self.state.append_history("user", user_text)
         self._clamp_history()
-        # برای user معمولاً domain/intent نداریم
         self.session_store.log_turn("user", user_text)
 
         # ask the brain
         brain_json = self.brain.infer(user_text, self.state)
         domain = str(brain_json.get("domain") or "smalltalk")
 
+        # 🔹 اینجا raw_json برای هر دامین ساخته می‌شود:
         if domain == "reservation":
             domain_payload = brain_json.get("reservation", {})
         elif domain == "sales":
             domain_payload = brain_json.get("sales", {})
         elif domain == "smalltalk":
             domain_payload = brain_json.get("smalltalk", {})
-        elif domain == "produce":
+        elif domain == "produce":  # 👈 این بلوک جدید
             domain_payload = brain_json.get("produce", {})
         else:
             domain_payload = {}
 
+        # این دو خط باعث می‌شوند داخل raw_json مقدار intent و reply هم همیشه باشد
         domain_payload.setdefault("intent", brain_json.get("intent"))
         domain_payload.setdefault("reply", brain_json.get("reply"))
 
+        # حالا skill مناسب را بردار و raw_json را بهش بده
         skill = self.skills.get(domain, self.skills["smalltalk"])
-        result = skill.handle(user_text, self.state, domain_payload)
+        result = skill.handle(user_text, self.state, domain_payload)  # 👈 raw_json همین domain_payload است
 
-        # remember + log assistant reply
+        # log + snapshot مثل قبل ...
         self.state.append_history("assistant", result.reply)
         self._clamp_history()
-        # اینجا domain + intent را می‌چسبانیم
         self.session_store.log_turn("assistant", result.reply, domain=result.domain, intent=result.intent)
-
-        # remember known clients (for reservation domain)
-        if result.domain == "reservation":
-            name = result.payload.get("name")
-            if isinstance(name, str) and name.strip():
-                self.clients_store.add(name)
-
-        # save snapshot of state (profile, notes, etc.)
-        self.session_store.save_snapshot(self.state)
-
+        ...
         return result
 
 
