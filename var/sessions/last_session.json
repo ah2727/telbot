@@ -1,10 +1,16 @@
 {
-  "session": "session-20251201-183524",
+  "session": "session-20251201-194424",
   "profile": {
-    "name": "ایجاری",
-    "address": null
+    "name": "علی",
+    "address": "پنام خانه وادیگی"
   },
   "notes": [],
-  "reservation": {},
-  "sales": {}
+  "reservation": {
+    "appointment": "فردا"
+  },
+  "sales": {
+    "last_product": "دستیار صوتی",
+    "last_quantity": 1
+  },
+  "produce": {}
 }

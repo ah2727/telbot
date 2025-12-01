@@ -11,6 +11,7 @@ from ..skills.base import BaseSkill
 from ..skills.reservation import ReservationSkill
 from ..skills.sales import SalesSkill
 from ..skills.smalltalk import SmallTalkSkill
+from ..skills.produce import ProduceSkill
 from ..io.voice_io import VoiceIO
 from ..persistence.file_store import SessionStore
 from ..persistence.clients_store import ClientsStore
@@ -37,6 +38,7 @@ class MultiDomainBot:
             "reservation": ReservationSkill(client),
             "sales": SalesSkill(client),
             "smalltalk": SmallTalkSkill(client),
+            "produce": ProduceSkill(client),
         }
 
         # persistence
@@ -57,6 +59,7 @@ class MultiDomainBot:
         # remember + log user
         self.state.append_history("user", user_text)
         self._clamp_history()
+        # برای user معمولاً domain/intent نداریم
         self.session_store.log_turn("user", user_text)
 
         # ask the brain
@@ -69,6 +72,8 @@ class MultiDomainBot:
             domain_payload = brain_json.get("sales", {})
         elif domain == "smalltalk":
             domain_payload = brain_json.get("smalltalk", {})
+        elif domain == "produce":
+            domain_payload = brain_json.get("produce", {})
         else:
             domain_payload = {}
 
@@ -81,7 +86,8 @@ class MultiDomainBot:
         # remember + log assistant reply
         self.state.append_history("assistant", result.reply)
         self._clamp_history()
-        self.session_store.log_turn("assistant", result.reply)
+        # اینجا domain + intent را می‌چسبانیم
+        self.session_store.log_turn("assistant", result.reply, domain=result.domain, intent=result.intent)
 
         # remember known clients (for reservation domain)
         if result.domain == "reservation":
@@ -93,6 +99,7 @@ class MultiDomainBot:
         self.session_store.save_snapshot(self.state)
 
         return result
+
 
     # ---------- loops ----------
 

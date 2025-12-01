@@ -26,7 +26,7 @@ class BotConfig:
     record_seconds: float = 8.0
 
     push_chunk_seconds: float = 0.3
-    push_silence_timeout: float = 0.6
+    push_silence_timeout: float = 1.5
     push_energy_threshold: float = 80.0
     silence_trim_threshold: float = 40.0
 

@@ -8,6 +8,7 @@ from openai import OpenAI, OpenAIError
 
 from ..config import PROMPTS_DIR
 from .state import ConversationState
+from ..skills.produce import ProduceSkill
 
 
 def _load_prompt(name: str) -> str:
@@ -91,6 +92,7 @@ class MultiDomainBrain:
                 "appointment": None,
                 "notes": None,
             },
+            "produce": ProduceSkill(self.client),
             "sales": {"product": None, "quantity": None, "notes": None},
             "smalltalk": {"intent": "smalltalk"},
         }

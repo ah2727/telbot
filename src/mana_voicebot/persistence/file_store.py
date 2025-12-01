@@ -58,7 +58,7 @@ class SessionStore:
 
         # also save initial snapshot
         self.save_snapshot(state)
-
+        
     def save_snapshot(self, state: ConversationState) -> None:
         snapshot = {
             "session": self.session_name,
@@ -66,21 +66,30 @@ class SessionStore:
             "notes": state.notes,
             "reservation": state.reservation_state,
             "sales": state.sales_state,
+            "produce": state.produce_state,  # 👈 اضافه شد
         }
         self.snapshot_file.write_text(
             json.dumps(snapshot, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-
     # ---------- logging text turns ----------
-
-    def log_turn(self, role: str, text: str) -> None:
+    def log_turn(self, role: str, text: str, domain: str | None = None, intent: str | None = None) -> None:
         """
         Append one line to session_log.txt:
         [session-name] role: text
+        یا اگر domain/intent داده شد:
+        [session-name] role(domain:intent): text
         """
         if not self.session_name:
             return
-        line = f"[{self.session_name}] {role}: {text}\n"
+
+        if domain and intent:
+            tag = f"{role}({domain}:{intent})"
+        elif domain:
+            tag = f"{role}({domain})"
+        else:
+            tag = role
+
+        line = f"[{self.session_name}] {tag}: {text}\n"
         with self.log_file.open("a", encoding="utf-8") as h:
             h.write(line)

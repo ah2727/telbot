@@ -12,6 +12,10 @@ class SkillResult:
     payload: Dict[str, Any] = field(default_factory=dict)
 
 
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, List
+
+
 @dataclass
 class ConversationState:
     """Global state shared between skills."""
@@ -23,7 +27,7 @@ class ConversationState:
 
     reservation_state: Dict[str, Any] = field(default_factory=dict)
     sales_state: Dict[str, Any] = field(default_factory=dict)
+    produce_state: Dict[str, Any] = field(default_factory=dict)  # 👈 این خط جدید
 
     def append_history(self, role: str, text: str) -> None:
         self.history.append({"role": role, "text": text})
-        # clamp in orchestrator if needed
