@@ -16,7 +16,7 @@ from ..io.voice_io import VoiceIO
 from ..persistence.file_store import SessionStore
 from ..persistence.clients_store import ClientsStore
 from ..skills.produce import ProduceSkill
-
+from ..skills.visitor import VisitorSkill
 
 class MultiDomainBot:
     """
@@ -39,7 +39,8 @@ class MultiDomainBot:
             "reservation": ReservationSkill(client),
             "sales": SalesSkill(client),
             "smalltalk": SmallTalkSkill(client),
-            "produce": ProduceSkill(client),  # 👈 این خط مهم
+            "produce": ProduceSkill(client),  
+            "visitor": VisitorSkill(client), 
         }
 
         # persistence
@@ -73,8 +74,10 @@ class MultiDomainBot:
             domain_payload = brain_json.get("sales", {})
         elif domain == "smalltalk":
             domain_payload = brain_json.get("smalltalk", {})
-        elif domain == "produce":  # 👈 این بلوک جدید
+        elif domain == "produce": 
             domain_payload = brain_json.get("produce", {})
+        elif domain == "visitor": 
+            domain_payload = brain_json.get("visitor", {})
         else:
             domain_payload = {}
 
@@ -150,6 +153,10 @@ class MultiDomainBot:
         if isinstance(notes, list):
             self.state.notes = [str(n) for n in notes]
 
+        visitor = snapshot.get("visitor")
+        if isinstance(visitor, dict):
+            self.state.visitor_state = visitor
+      
         reservation = snapshot.get("reservation")
         if isinstance(reservation, dict):
             self.state.reservation_state = reservation

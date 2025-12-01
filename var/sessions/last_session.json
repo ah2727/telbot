@@ -1,5 +1,5 @@
 {
-  "session": "session-20251201-200256",
+  "session": "session-20251201-202122",
   "profile": {
     "name": "علی",
     "address": "پنام خانه وادیگی"
@@ -12,5 +12,6 @@
     "last_product": "عصبی",
     "last_quantity": 1
   },
-  "produce": {}
+  "produce": {},
+  "visitor": {}
 }

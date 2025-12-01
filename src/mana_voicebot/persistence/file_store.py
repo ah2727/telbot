@@ -66,7 +66,8 @@ class SessionStore:
             "notes": state.notes,
             "reservation": state.reservation_state,
             "sales": state.sales_state,
-            "produce": state.produce_state,  # 👈 اضافه شد
+            "produce": state.produce_state,
+            "visitor": state.visitor_state,  # 👈 این
         }
         self.snapshot_file.write_text(
             json.dumps(snapshot, indent=2, ensure_ascii=False),

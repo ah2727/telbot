@@ -32,10 +32,25 @@ class MultiDomainBrain:
 
     def infer(self, user_text: str, state: ConversationState) -> Dict[str, Any]:
         history_text = self._history_to_text(state.history)
+
+        # 👇 این بخش جدید: snapshot از state برای کمک به "یادگیری درون جلسه"
+        state_snapshot = {
+            "profile": state.profile,
+            "notes": state.notes,
+            "reservation": state.reservation_state,
+            "sales": state.sales_state,
+            "produce": getattr(state, "produce_state", {}),
+        }
+        snapshot_json = json.dumps(state_snapshot, ensure_ascii=False)
+
         user_payload = (
-            f"Conversation so far:\n{history_text}\n\n"
-            f"User said:\n{user_text}\n\n"
-            "Remember to respond ONLY with one JSON as described."
+            "Conversation so far:\n"
+            f"{history_text}\n\n"
+            "Current state snapshot (from previous turns in this session):\n"
+            f"{snapshot_json}\n\n"
+            "User said:\n"
+            f"{user_text}\n\n"
+            "Remember to respond ONLY with one JSON as described in the system prompt."
         )
 
         try:
@@ -59,7 +74,7 @@ class MultiDomainBrain:
 
         raw = self._extract_text(resp)
         return self._parse_json(raw)
-
+    
     def _extract_text(self, response) -> str:
         chunks: List[str] = []
         for item in getattr(response, "output", []) or []:
