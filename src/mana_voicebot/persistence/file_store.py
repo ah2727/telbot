@@ -74,12 +74,17 @@ class SessionStore:
             encoding="utf-8",
         )
     # ---------- logging text turns ----------
-    def log_turn(self, role: str, text: str, domain: str | None = None, intent: str | None = None) -> None:
+    def log_turn(
+        self,
+        role: str,
+        text: str,
+        domain: str | None = None,
+        intent: str | None = None,
+        usage: dict | None = None,
+    ) -> None:
         """
         Append one line to session_log.txt:
-        [session-name] role: text
-        یا اگر domain/intent داده شد:
-        [session-name] role(domain:intent): text
+        [session] role(domain:intent)[tokens in:x out:y total:z]: text
         """
         if not self.session_name:
             return
@@ -91,6 +96,13 @@ class SessionStore:
         else:
             tag = role
 
-        line = f"[{self.session_name}] {tag}: {text}\n"
+        usage_part = ""
+        if usage:
+            in_t = int(usage.get("input_tokens", 0) or 0)
+            out_t = int(usage.get("output_tokens", 0) or 0)
+            total_t = int(usage.get("total_tokens", 0) or 0)
+            usage_part = f" [tokens in:{in_t} out:{out_t} total:{total_t}]"
+
+        line = f"[{self.session_name}] {tag}{usage_part}: {text}\n"
         with self.log_file.open("a", encoding="utf-8") as h:
             h.write(line)

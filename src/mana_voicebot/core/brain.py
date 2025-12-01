@@ -30,16 +30,16 @@ class MultiDomainBrain:
         self.model = model
         self.system_prompt = _load_prompt(MAIN_PROMPT_FILE)
 
-    def infer(self, user_text: str, state: ConversationState) -> Dict[str, Any]:
+    def infer(self, user_text: str, state: ConversationState) -> tuple[Dict[str, Any], Dict[str, int]]:
         history_text = self._history_to_text(state.history)
 
-        # 👇 این بخش جدید: snapshot از state برای کمک به "یادگیری درون جلسه"
         state_snapshot = {
             "profile": state.profile,
             "notes": state.notes,
             "reservation": state.reservation_state,
             "sales": state.sales_state,
             "produce": getattr(state, "produce_state", {}),
+            "visitor": getattr(state, "visitor_state", {}),
         }
         snapshot_json = json.dumps(state_snapshot, ensure_ascii=False)
 
@@ -70,11 +70,21 @@ class MultiDomainBrain:
             )
         except OpenAIError as exc:
             print(f"[brain] OpenAI error: {exc}")
-            return self._fallback_json()
+            return self._fallback_json(), {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
         raw = self._extract_text(resp)
-        return self._parse_json(raw)
-    
+
+        # 👇 usage از response
+        usage_obj = getattr(resp, "usage", None)
+        usage: Dict[str, int] = {
+            "input_tokens": getattr(usage_obj, "input_tokens", 0) if usage_obj else 0,
+            "output_tokens": getattr(usage_obj, "output_tokens", 0) if usage_obj else 0,
+            "total_tokens": getattr(usage_obj, "total_tokens", 0) if usage_obj else 0,
+        }
+
+        return self._parse_json(raw), usage
+
+        
     def _extract_text(self, response) -> str:
         chunks: List[str] = []
         for item in getattr(response, "output", []) or []:

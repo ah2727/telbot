@@ -64,7 +64,7 @@ class MultiDomainBot:
         self.session_store.log_turn("user", user_text)
 
         # ask the brain
-        brain_json = self.brain.infer(user_text, self.state)
+        brain_json, usage = self.brain.infer(user_text, self.state)
         domain = str(brain_json.get("domain") or "smalltalk")
 
         # 🔹 اینجا raw_json برای هر دامین ساخته می‌شود:
@@ -92,12 +92,66 @@ class MultiDomainBot:
         # log + snapshot مثل قبل ...
         self.state.append_history("assistant", result.reply)
         self._clamp_history()
-        self.session_store.log_turn("assistant", result.reply, domain=result.domain, intent=result.intent)
-        ...
+        self.session_store.log_turn("assistant", result.reply, domain=result.domain, intent=result.intent,usage=usage)
+
         return result
 
 
     # ---------- loops ----------
+
+    def _start_visitor_intro(self, product_name: str = "TeleBot AI") -> None:
+        """
+        یک بار در شروع visitor mode صدا زده می‌شود.
+        بدون کمک مغز مرکزی، مستقیم VisitorSkill را برای intent = intro فراخوانی می‌کنیم
+        تا مکالمه را با یک معرفی و گرفتن اجازه شروع کند.
+        """
+        visitor_skill = self.skills.get("visitor")
+        if not isinstance(visitor_skill, BaseSkill):
+            # اگر به هر دلیل visitor ثبت نشده بود، هندل ساده:
+            intro = (
+                f"سلام، من دستیار فروش {product_name} هستم. "
+                "اگر موافق باشید، در چند جمله توضیح می‌دهم این ربات چه کمکی می‌کند، "
+                "بعد می‌توانید سوال‌های‌تان را بپرسید."
+            )
+            self.state.append_history("assistant", intro)
+            self._clamp_history()
+            self.session_store.log_turn("assistant", intro, domain="visitor", intent="intro")
+            if self.voice:
+                self.voice.speak(intro)
+            else:
+                print(f"[visitor/intro] {intro}")
+            return
+
+        # raw_json اولیه برای intro
+        raw_json = {
+            "intent": "intro",
+            "product_name": product_name,
+            "visitor_name": self.state.profile.get("name"),
+        }
+
+        result = visitor_skill.handle(
+            turn_text="",
+            state=self.state,
+            raw_json=raw_json,
+        )
+
+        # history + log
+        self.state.append_history("assistant", result.reply)
+        self._clamp_history()
+        self.session_store.log_turn(
+            "assistant",
+            result.reply,
+            domain=result.domain,
+            intent=result.intent,
+            usage=None,  # این intro بدون call به مغز است
+        )
+
+        # خروجی به کاربر
+        if self.voice:
+            self.voice.speak(result.reply)
+        else:
+            print(f"[visitor/intro] {result.reply}")
+
 
     def loop_text_only(self) -> None:
         print("Multi-domain bot (text mode). Type 'q' to quit.")
@@ -114,6 +168,47 @@ class MultiDomainBot:
         if self.voice is None:
             raise RuntimeError("VoiceIO is not configured.")
         print("Multi-domain bot (voice mode). Ctrl+C to exit.")
+
+        while True:
+            try:
+                text = self.voice.record()
+            except KeyboardInterrupt:
+                break
+
+            if not text:
+                continue
+
+            result = self.handle_turn(text)
+            self.voice.speak(result.reply)
+    def loop_visitor_text(self, product_name: str = "TeleBot AI") -> None:
+        """
+        حالت visitor برای متن: ابتدا خودش مکالمه را شروع می‌کند،
+        بعد هر ورودی را مثل همیشه از مغز و skillها عبور می‌دهد.
+        """
+        print(f"Visitor mode (text) for {product_name}. Type 'q' to quit.")
+        # شروع مکالمه
+        self._start_visitor_intro(product_name)
+
+        while True:
+            user_text = input("You: ").strip()
+            if user_text.lower() == "q":
+                break
+            if not user_text:
+                continue
+            result = self.handle_turn(user_text)
+            print(f"[{result.domain}/{result.intent}] Bot:", result.reply)
+
+    def loop_visitor_voice(self, product_name: str = "TeleBot AI") -> None:
+        """
+        حالت visitor برای voice: اول خودش معرفی می‌کند و اجازه می‌گیرد،
+        سپس هر بار از کاربر صدا می‌گیرد و جواب می‌دهد.
+        """
+        if self.voice is None:
+            raise RuntimeError("VoiceIO is not configured for visitor voice mode.")
+
+        print(f"Visitor mode (voice) for {product_name}. Ctrl+C to exit.")
+        # شروع مکالمه
+        self._start_visitor_intro(product_name)
 
         while True:
             try:
